@@ -1,0 +1,20 @@
+﻿[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sample-organizer"
+version = "0.1.0"
+authors = [
+  { name="Giovanni Antonecchia", email="gio.antonecchia961@gmail.com" },
+]
+description = "Audio Sample Analysis, Musical Key Detection & Library Organization Engine"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.22.0",
+    "scipy>=1.8.0",
+]
+
+[project.scripts]
+sample-organizer = "sample_organizer.cli:main"

@@ -16,12 +16,12 @@ def classify_sample(
     key_info: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Heuristic classification into audio sample categories.
+    Robust heuristic classification combining spectral, harmonic, and rhythmic dynamics.
 
     Categories:
     - Kicks, Snares_Claps, Hats_Cymbals, Percussion (one-shots)
-    - Drum_Loops, Melodic_Loops, FX_Textures (loops & long samples)
-    - Unknown (insufficient evidence or silence)
+    - Drum_Loops, Melodic_Loops, FX_Textures (loops & long audio)
+    - Unknown (insufficient evidence, ambiguous, or silence)
     """
     duration = metrics.get("duration_sec", 0.0)
     crest_factor = metrics.get("crest_factor_db", 0.0)
@@ -29,35 +29,50 @@ def classify_sample(
     peak_db = metrics.get("peak_db", -120.0)
     low_ratio = metrics.get("low_energy_ratio", 0.0)
     high_ratio = metrics.get("high_energy_ratio", 0.0)
+    centroid = metrics.get("spectral_centroid", 0.0)
 
     if peak_db < -55.0:
         return "Unknown"
 
-    # Short percussive hits (one-shots)
+    # Short percussive hits (one-shots: duration < 1.2s)
     if duration < 1.2:
-        if high_ratio > 0.35 or zcr > 0.15:
+        if high_ratio > 0.35 or zcr > 0.15 or centroid > 5000.0:
             return "Hats_Cymbals"
-        if low_ratio > 0.35 and crest_factor > 11.0:
+        if low_ratio > 0.35 and crest_factor > 10.5 and centroid < 800.0:
             return "Kicks"
-        if crest_factor > 10.0:
+        if crest_factor > 9.0 and (centroid > 800.0 or high_ratio > 0.10):
             return "Snares_Claps"
-        if crest_factor > 6.0:
+        if crest_factor > 5.5:
             return "Percussion"
         return "Unknown"
 
-    # Longer audio loops or stems (duration >= 1.2s)
-    has_key = (
+    # Loops & Sustained Audio (duration >= 1.2s)
+    key_conf = key_info.get("confidence", 0.0) if key_info else 0.0
+    has_tonal_key = (
         key_info is not None
         and key_info.get("key") != "Unknown"
-        and key_info.get("confidence", 0.0) >= 0.30
+        and key_conf >= 0.35
     )
     is_rhythmic = bpm_info.get("is_rhythmic", False)
 
-    if has_key:
-        return "Melodic_Loops"
+    # Multi-feature disambiguation between Drum Loops and Melodic Loops
     if is_rhythmic:
+        # High harmonic confidence + moderate crest factor indicates melodic instrumentation
+        if key_conf >= 0.65:
+            return "Melodic_Loops"
+        if key_conf >= 0.45 and crest_factor < 10.0:
+            return "Melodic_Loops"
+
+        # Strong percussive crest factor or weak tonal confidence indicates drum loop
+        if crest_factor >= 9.5 or key_conf < 0.45:
+            return "Drum_Loops"
+
         return "Drum_Loops"
-    if crest_factor > 4.0:
+
+    # Non-rhythmic long audio
+    if has_tonal_key and key_conf >= 0.45:
+        return "Melodic_Loops"
+    if crest_factor > 3.5:
         return "FX_Textures"
 
     return "Unknown"
@@ -96,7 +111,11 @@ def scan_directory(
     supported_exts: Optional[List[str]] = None,
     exclude_dirs: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Scan a folder recursively and analyze all audio files."""
+    """
+    Scan a folder recursively and analyze all audio files.
+
+    Distinguishes and preserves read vs analysis errors with full file paths.
+    """
     if not os.path.isdir(directory_path):
         raise ValueError(f"Directory not found: '{directory_path}'")
 
@@ -112,7 +131,6 @@ def scan_directory(
 
     results = []
     for root, dirnames, files in os.walk(directory_path):
-        # Prune excluded directories in-place
         dirnames[:] = [
             d for d in dirnames
             if os.path.realpath(os.path.join(root, d)) not in excluded_canonical
@@ -122,11 +140,47 @@ def scan_directory(
             ext = os.path.splitext(f)[1].lower()
             if ext in supported_exts_lower:
                 full_path = os.path.join(root, f)
+                # First attempt reading
                 try:
-                    analysis = analyze_file(full_path)
-                    results.append(analysis)
-                except Exception as e:
-                    results.append({"file_path": full_path, "error": str(e)})
+                    signal, sr = load_audio(full_path)
+                except Exception as read_exc:
+                    results.append({
+                        "file_path": full_path,
+                        "filename": f,
+                        "error": str(read_exc),
+                        "error_type": "read",
+                    })
+                    continue
+
+                # Then attempt analysis
+                try:
+                    metrics = calculate_metrics(signal, sr)
+                    key_info = estimate_key(signal, sr)
+                    bpm_info = estimate_bpm(signal, sr)
+                    category = classify_sample(metrics, bpm_info, key_info=key_info)
+
+                    results.append({
+                        "file_path": full_path,
+                        "filename": f,
+                        "extension": ext,
+                        "sample_rate": sr,
+                        "category": category,
+                        "metrics": metrics,
+                        "key": key_info["key"],
+                        "root": key_info["root"],
+                        "scale": key_info["scale"],
+                        "key_confidence": key_info["confidence"],
+                        "bpm": bpm_info["bpm"],
+                        "bpm_confidence": bpm_info["confidence"],
+                        "is_rhythmic": bpm_info["is_rhythmic"],
+                    })
+                except Exception as analysis_exc:
+                    results.append({
+                        "file_path": full_path,
+                        "filename": f,
+                        "error": str(analysis_exc),
+                        "error_type": "analysis",
+                    })
 
     return results
 
@@ -156,21 +210,12 @@ def organize_samples(
     mode: str = "copy",  # "copy", "move", "dry-run"
 ) -> Dict[str, Any]:
     """
-    Sort analyzed samples into organized destination folders without data loss.
+    Sort analyzed samples into organized destination folders safely.
 
-    Parameters
-    ----------
-    scan_results : List[dict]
-        Output list from scan_directory or analyze_file.
-    output_dir : str
-        Target folder for organized samples.
-    mode : str, default 'copy'
-        Operation mode: 'copy', 'move', or 'dry-run'.
-
-    Returns
-    -------
-    dict with keys:
-        total, processed, planned, errors, operations
+    Guarantees:
+    - Never overwrites existing destination files (deterministic collision renaming).
+    - Preserves source file integrity and validates size on copy.
+    - Captures and categorizes read, analysis, and write errors per file.
     """
     valid_modes = ("copy", "move", "dry-run")
     if mode not in valid_modes:
@@ -187,21 +232,29 @@ def organize_samples(
     reserved_paths: Set[str] = set()
 
     for item in scan_results:
-        if "error" in item or "file_path" not in item:
+        src_path = item.get("file_path")
+        if not src_path or "error" in item:
             summary["errors"] += 1
+            summary["operations"].append({
+                "source": src_path or "unknown",
+                "destination": None,
+                "category": "Unknown",
+                "mode": mode,
+                "status": "error",
+                "error_type": item.get("error_type", "scan"),
+                "error_msg": item.get("error", "Scan error"),
+            })
             continue
 
-        src_path = os.path.normpath(item["file_path"])
+        src_path = os.path.normpath(src_path)
         category = item.get("category", "Unknown")
 
-        # Extract musical metadata safely
         has_key = item.get("key") and item.get("key") != "Unknown" and item.get("key_confidence", 0) >= 0.35
         has_bpm = item.get("bpm") is not None and item.get("is_rhythmic", False)
 
         key_part = f"{item['root']}_{item['scale']}" if has_key else None
         bpm_part = f"{int(round(item['bpm']))}BPM" if has_bpm else None
 
-        # Determine subfolder structure
         if "Loops" in category:
             if bpm_part and key_part:
                 subfolder = os.path.join(output_dir, category, f"{bpm_part}_{key_part}")
@@ -214,7 +267,6 @@ def organize_samples(
         else:
             subfolder = os.path.join(output_dir, category)
 
-        # Build clean non-polluting filename prefix
         orig_filename = item["filename"]
         prefix_parts = []
         if key_part:
@@ -239,29 +291,42 @@ def organize_samples(
         }
 
         if mode == "dry-run":
-            # Completely non-destructive: no mkdir, no file operations
             summary["planned"] += 1
             summary["operations"].append(op)
             continue
 
-        # Physical copy or move
+        # Physical execution with safety checks
         try:
             if src_path == final_dest:
                 raise ValueError("Source and destination paths are identical")
 
+            if not os.path.exists(src_path):
+                raise FileNotFoundError(f"Source file disappeared: '{src_path}'")
+
+            src_size = os.path.getsize(src_path)
             os.makedirs(os.path.dirname(final_dest), exist_ok=True)
 
             if mode == "copy":
                 shutil.copy2(src_path, final_dest)
+                # Verify integrity
+                if not os.path.exists(src_path) or os.path.getsize(src_path) != src_size:
+                    raise RuntimeError(f"Integrity check failed: source file '{src_path}' was modified")
+                if not os.path.exists(final_dest) or os.path.getsize(final_dest) != src_size:
+                    raise RuntimeError(f"Integrity check failed: destination size mismatch on '{final_dest}'")
                 op["status"] = "copied"
+
             elif mode == "move":
                 shutil.move(src_path, final_dest)
+                if not os.path.exists(final_dest):
+                    raise RuntimeError(f"Failed to verify moved destination '{final_dest}'")
                 op["status"] = "moved"
 
             summary["processed"] += 1
             summary["planned"] += 1
+
         except Exception as exc:
             op["status"] = "error"
+            op["error_type"] = "write"
             op["error_msg"] = str(exc)
             summary["errors"] += 1
 

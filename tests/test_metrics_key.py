@@ -1,4 +1,5 @@
-"""Dedicated tests for Metrics and Key Detection (Phase 2)."""
+"""Dedicated tests for Metrics and Key Detection (Phase 2 & Phase 6 Refinements)."""
+import time
 import numpy as np
 import pytest
 from sample_organizer.metrics import calculate_metrics, detect_silence
@@ -8,7 +9,6 @@ from sample_organizer.key_detector import compute_chroma, estimate_key
 def test_calculate_metrics_valid():
     sr = 44100
     t = np.linspace(0, 1.0, sr, endpoint=False)
-    # Sine wave with amplitude 0.5
     signal = (0.5 * np.sin(2 * np.pi * 100.0 * t)).astype(np.float32)
 
     m = calculate_metrics(signal, sr)
@@ -19,21 +19,18 @@ def test_calculate_metrics_valid():
     assert m["crest_factor_db"] == pytest.approx(3.01, abs=0.2)
     assert m["zcr"] > 0.003
     assert m["spectral_centroid"] > 50.0
-    assert m["low_energy_ratio"] > 0.8  # 100 Hz tone is below 250 Hz
+    assert m["low_energy_ratio"] > 0.8
 
 
 def test_calculate_metrics_edge_cases():
     sr = 44100
-    # Empty array
     empty_m = calculate_metrics(np.array([], dtype=np.float32), sr)
     assert empty_m["duration_sec"] == 0.0
     assert empty_m["peak_db"] == -120.0
 
-    # Non-finite values
     nan_m = calculate_metrics(np.array([0.1, np.nan, np.inf]), sr)
     assert nan_m["duration_sec"] == 0.0
 
-    # Invalid sample rate
     with pytest.raises(ValueError):
         calculate_metrics(np.array([0.1]), -44100)
 
@@ -45,19 +42,55 @@ def test_detect_silence():
     assert start == 100
     assert end == 599
 
-    # All silence
     start_sil, end_sil = detect_silence(np.zeros(500), -40.0)
     assert start_sil == 0 and end_sil == 0
-
-    # Empty
     assert detect_silence(np.array([])) == (0, 0)
+
+
+def test_spectral_metrics_across_full_signal():
+    """Verify spectral aggregation covers the full audio file beyond the first 2048 samples."""
+    sr = 44100
+    total_samples = sr * 2  # 2 seconds
+    signal = np.zeros(total_samples, dtype=np.float32)
+
+    # First second: 100 Hz low-frequency bass
+    t_low = np.linspace(0, 1.0, sr, endpoint=False)
+    signal[:sr] = 0.5 * np.sin(2 * np.pi * 100.0 * t_low)
+
+    # Second second: 6000 Hz high-frequency sheen (well beyond sample 2048!)
+    t_high = np.linspace(0, 1.0, sr, endpoint=False)
+    signal[sr:] = 0.5 * np.sin(2 * np.pi * 6000.0 * t_high)
+
+    m = calculate_metrics(signal, sr)
+    # Both low and high power must be represented
+    assert m["low_energy_ratio"] > 0.15
+    assert m["high_energy_ratio"] > 0.15
+    # Centroid should be balanced between the low and high sections
+    assert 1000.0 < m["spectral_centroid"] < 5000.0
+
+
+def test_spectral_power_efficiency_long_file():
+    """Verify performance and numerical stability on long audio files."""
+    sr = 44100
+    # 30 seconds of audio
+    signal = np.random.uniform(-0.1, 0.1, sr * 30).astype(np.float32)
+
+    start_t = time.perf_counter()
+    m = calculate_metrics(signal, sr)
+    elapsed = time.perf_counter() - start_t
+
+    # Must complete in well under 0.5 seconds
+    assert elapsed < 0.5
+    assert m["duration_sec"] == 30.0
+    assert np.isfinite(m["spectral_centroid"])
+    assert 0.0 <= m["low_energy_ratio"] <= 1.0
+    assert 0.0 <= m["high_energy_ratio"] <= 1.0
 
 
 def test_key_detection_triads():
     sr = 44100
     t = np.linspace(0, 2.0, sr * 2, endpoint=False)
 
-    # 1. C Major Triad (C4=261.63, E4=329.63, G4=392.00)
     c_maj = (
         0.3 * np.sin(2 * np.pi * 261.63 * t) +
         0.3 * np.sin(2 * np.pi * 329.63 * t) +
@@ -70,7 +103,6 @@ def test_key_detection_triads():
     assert res_c["scale"] == "Major"
     assert res_c["confidence"] > 0.5
 
-    # 2. A Minor Triad (A4=440.00, C5=523.25, E5=659.25)
     a_min = (
         0.3 * np.sin(2 * np.pi * 440.00 * t) +
         0.3 * np.sin(2 * np.pi * 523.25 * t) +
@@ -86,16 +118,13 @@ def test_key_detection_triads():
 
 def test_key_detection_non_tonal_and_silence():
     sr = 44100
-    # Pure silence
     res_sil = estimate_key(np.zeros(2048, dtype=np.float32), sr)
     assert res_sil["key"] == "Unknown"
     assert res_sil["confidence"] == 0.0
 
-    # Short signal
     res_short = estimate_key(np.array([0.1, -0.1] * 50, dtype=np.float32), sr)
     assert res_short["key"] == "Unknown"
 
-    # White noise (non-tonal, ambiguous)
     np.random.seed(42)
     noise = np.random.uniform(-0.1, 0.1, sr * 2).astype(np.float32)
     res_noise = estimate_key(noise, sr)

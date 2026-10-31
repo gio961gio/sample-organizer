@@ -81,34 +81,38 @@ def handle_scan(args: argparse.Namespace):
     valid = [r for r in results if "error" not in r]
     errors = [r for r in results if "error" in r]
 
-    print(f"Scanned {len(results)} files ({len(valid)} analyzed, {len(errors)} errors).\n")
+    read_errors = sum(1 for e in errors if e.get("error_type") == "read")
+    analysis_errors = sum(1 for e in errors if e.get("error_type") == "analysis")
+
+    print(f"Scanned {len(results)} files ({len(valid)} analyzed, {read_errors} read errors, {analysis_errors} analysis errors).\n")
 
     if not valid:
         print("No valid audio samples found.")
-        return
+    else:
+        headers = ["Filename", "Category", "Key", "BPM", "Duration", "Peak (dB)"]
+        rows = []
+        for r in valid[:40]:
+            bpm_str = f"{int(round(r['bpm']))}" if r.get("bpm") is not None else "-"
+            key_str = r.get("key", "Unknown")
+            rows.append([
+                r["filename"][:25],
+                r["category"],
+                key_str,
+                bpm_str,
+                f"{r['metrics']['duration_sec']}s",
+                f"{r['metrics']['peak_db']}",
+            ])
 
-    headers = ["Filename", "Category", "Key", "BPM", "Duration", "Peak (dB)"]
-    rows = []
-    for r in valid[:40]:
-        bpm_str = f"{int(round(r['bpm']))}" if r.get("bpm") is not None else "-"
-        key_str = r.get("key", "Unknown")
-        rows.append([
-            r["filename"][:25],
-            r["category"],
-            key_str,
-            bpm_str,
-            f"{r['metrics']['duration_sec']}s",
-            f"{r['metrics']['peak_db']}",
-        ])
-
-    print(format_table(rows, headers))
-    if len(valid) > 40:
-        print(f"\n... and {len(valid) - 40} more samples.")
+        print(format_table(rows, headers))
+        if len(valid) > 40:
+            print(f"\n... and {len(valid) - 40} more samples.")
 
     if errors:
-        print(f"\n[Warnings] {len(errors)} file(s) could not be read:")
-        for err in errors[:5]:
-            print(f"  - {os.path.basename(err.get('file_path', 'unknown'))}: {err.get('error', 'unknown error')}")
+        print(f"\n[Warnings] {len(errors)} file(s) failed:")
+        for err in errors[:10]:
+            err_type = err.get("error_type", "scan").capitalize()
+            path = err.get("file_path", "unknown")
+            print(f"  - [{err_type} Error] {path}: {err.get('error', 'Unknown error')}")
 
 
 def handle_organize(args: argparse.Namespace):
@@ -118,26 +122,32 @@ def handle_organize(args: argparse.Namespace):
         sys.exit(1)
 
     print(f"\nScanning '{args.source}' for organization...")
-    # Exclude output dir if it resides inside source
     results = scan_directory(args.source, exclude_dirs=[args.destination])
     valid_count = sum(1 for r in results if "error" not in r)
+    error_scan_count = len(results) - valid_count
 
-    print(f"Found {valid_count} samples to organize (Mode: {args.mode}). Destination: '{args.destination}'")
+    print(f"Found {valid_count} valid samples to organize ({error_scan_count} scan errors). Mode: {args.mode}. Destination: '{args.destination}'")
 
     summary = organize_samples(results, args.destination, mode=args.mode)
 
     if args.mode == "dry-run":
         print(f"\n[Dry Run] Planned operations: {summary['planned']} (No files written to disk)")
         for op in summary["operations"][:10]:
-            print(f"  [Plan] {os.path.basename(op['source'])} -> {op['destination']}")
+            if op.get("status") == "error":
+                print(f"  [Error] {op.get('source')}: {op.get('error_msg')}")
+            else:
+                print(f"  [Plan] {os.path.basename(op['source'])} -> {op['destination']}")
         if len(summary["operations"]) > 10:
             print(f"  ... and {len(summary['operations']) - 10} more planned operations.")
     else:
         print(f"\n[Completed] Processed: {summary['processed']} files, Errors: {summary['errors']}")
-        if summary["errors"] > 0:
-            for op in summary["operations"]:
-                if op.get("status") == "error":
-                    print(f"  - Error on '{os.path.basename(op['source'])}': {op.get('error_msg')}")
+
+    if summary["errors"] > 0:
+        print(f"\n[Error Details] {summary['errors']} operation(s) failed:")
+        for op in summary["operations"]:
+            if op.get("status") == "error":
+                err_type = op.get("error_type", "general").capitalize()
+                print(f"  - [{err_type} Error] {op.get('source')}: {op.get('error_msg')}")
 
 
 def main():

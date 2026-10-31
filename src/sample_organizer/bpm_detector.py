@@ -10,7 +10,11 @@ def estimate_bpm(
     max_bpm: float = 180.0,
 ) -> Dict[str, Any]:
     """
-    Estimate the tempo (BPM) of rhythmic audio signals.
+    Estimate the tempo (BPM) of rhythmic audio signals without arbitrary tempo priors.
+
+    Evaluates both half-time and double-time interpretations using objective
+    harmonic summation across integer lag multiples, then recalculates confidence
+    based on the definitive selected tempo.
 
     Parameters
     ----------
@@ -29,7 +33,7 @@ def estimate_bpm(
         bpm : float or None
             Estimated beats per minute, or None if non-rhythmic or undetectable.
         confidence : float
-            Heuristic confidence score [0.0, 1.0].
+            Recalculated heuristic confidence score [0.0, 1.0].
         is_rhythmic : bool
             True if a periodic tempo was detected with sufficient confidence.
     """
@@ -44,12 +48,10 @@ def estimate_bpm(
         return default_non_rhythmic
 
     if not np.all(np.isfinite(signal)) or np.max(np.abs(signal)) < 1e-4:
-        # Silence or non-finite
         return default_non_rhythmic
 
     duration = len(signal) / sample_rate
     if duration < 0.6:
-        # Too short to reliably infer periodic rhythm
         return default_non_rhythmic
 
     # 20ms analysis window, 10ms hop
@@ -71,10 +73,16 @@ def estimate_bpm(
     onsets = np.diff(energy)
     onsets = np.maximum(0.0, onsets)
 
+    mean_energy = float(np.mean(energy))
     onset_std = float(np.std(onsets))
     onset_max = float(np.max(onsets))
-    if onset_max < 1e-6 or onset_std < 1e-6:
-        # Constant tone or silence
+
+    # Reject silence or continuous stationary tones with no rhythmic beat onsets
+    if onset_max < 1e-5 or onset_std < 1e-6:
+        return default_non_rhythmic
+
+    if mean_energy > 0 and (onset_std / mean_energy) < 0.05:
+        # Stationary continuous tone (e.g. constant sine or pad without onsets)
         return default_non_rhythmic
 
     # FFT-based autocorrelation
@@ -95,47 +103,63 @@ def estimate_bpm(
     if len(search_region) == 0:
         return default_non_rhythmic
 
-    # Score candidates with a gentle tempo prior (centered around 115 BPM) to break octave ambiguities
-    candidates = []
     mean_val = float(np.mean(search_region))
     std_val = float(np.std(search_region)) + 1e-8
 
-    for lag_rel, val in enumerate(search_region):
-        actual_lag = lag_rel + min_lag
-        period_sec = actual_lag / frame_rate
-        tempo = 60.0 / period_sec
+    # Find prominent local peaks in search region
+    candidate_lags = []
+    for lag in range(min_lag + 1, max_lag):
+        if autocorr[lag] > autocorr[lag - 1] and autocorr[lag] >= autocorr[lag + 1]:
+            if autocorr[lag] > mean_val:
+                candidate_lags.append(lag)
 
-        # Gaussian prior around 115 BPM (std = 45 BPM)
-        prior = np.exp(-0.5 * ((tempo - 115.0) / 45.0) ** 2)
-        score = (val - mean_val) * (0.8 + 0.4 * prior)
-        candidates.append((score, actual_lag, val, tempo))
+    if not candidate_lags:
+        # Fallback to argmax in search region
+        best_lag = int(np.argmax(search_region)) + min_lag
+        candidate_lags = [best_lag]
 
-    candidates.sort(key=lambda c: c[0], reverse=True)
-    best_score, best_lag, peak_val, best_tempo = candidates[0]
+    # Evaluate each candidate using unbiased harmonic summation:
+    # Harmonic score S(L) = autocorr[L] + 0.5 * autocorr[2L] + 0.25 * autocorr[3L]
+    scored_candidates = []
+    for lag in candidate_lags:
+        h_score = autocorr[lag]
+        if lag * 2 < len(autocorr):
+            h_score += 0.5 * autocorr[lag * 2]
+        if lag * 3 < len(autocorr):
+            h_score += 0.25 * autocorr[lag * 3]
 
-    # Periodicity significance
+        scored_candidates.append((h_score, lag))
+
+    scored_candidates.sort(key=lambda c: c[0], reverse=True)
+    best_score, selected_lag = scored_candidates[0]
+
+    # Recalculate confidence definitively on the selected lag
+    peak_val = autocorr[selected_lag]
     z_score = (peak_val - mean_val) / std_val
 
-    # Half-time / double-time preference check
-    # If the half-lag (double tempo) has a strong peak, prefer it if within limits
-    half_lag = best_lag // 2
-    if half_lag >= min_lag:
-        half_val = autocorr[half_lag]
-        if half_val > 0.88 * peak_val and 80.0 <= (60.0 / (half_lag / frame_rate)) <= 150.0:
-            best_lag = half_lag
-            best_tempo = 60.0 / (best_lag / frame_rate)
+    # Peak contrast with adjacent valleys
+    valley_window = max(2, int(frame_rate * 0.05))  # 50ms window
+    left_bound = max(min_lag, selected_lag - valley_window)
+    right_bound = min(max_lag, selected_lag + valley_window)
+    surrounding = autocorr[left_bound : right_bound + 1]
+    valley_val = float(np.min(surrounding)) if len(surrounding) > 0 else mean_val
+    peak_prominence = (peak_val - valley_val) / (std_val + 1e-8)
 
-    if z_score < 1.75 or peak_val <= 0:
+    if z_score < 1.75 or peak_val <= 0 or peak_prominence < 0.5:
         return default_non_rhythmic
 
-    confidence = float(np.clip((z_score - 1.5) / 3.0, 0.0, 1.0))
-    is_rhythmic = confidence >= 0.20
+    confidence_z = np.clip((z_score - 1.5) / 3.0, 0.0, 1.0)
+    confidence_prom = np.clip(peak_prominence / 3.0, 0.0, 1.0)
+    confidence = float(np.clip(0.6 * confidence_z + 0.4 * confidence_prom, 0.0, 1.0))
 
+    is_rhythmic = confidence >= 0.20
     if not is_rhythmic:
         return default_non_rhythmic
 
+    estimated_bpm = 60.0 / (selected_lag / frame_rate)
+
     return {
-        "bpm": round(float(best_tempo), 1),
+        "bpm": round(float(estimated_bpm), 1),
         "confidence": round(confidence, 3),
         "is_rhythmic": True,
     }

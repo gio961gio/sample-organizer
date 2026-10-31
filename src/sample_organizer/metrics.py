@@ -1,11 +1,14 @@
-"""Audio metrics computation: RMS, peak, crest factor, ZCR, and spectral features."""
+"""Audio metrics computation: RMS, peak, crest factor, ZCR, and aggregated spectral power features."""
 import numpy as np
 from typing import Dict, Any, Tuple
 
 
 def calculate_metrics(signal: np.ndarray, sample_rate: int) -> Dict[str, Any]:
     """
-    Compute standard acoustic dynamics and spectral metrics from an audio buffer.
+    Compute standard acoustic dynamics and aggregated spectral power metrics.
+
+    Spectral metrics are evaluated across the full duration of the signal using
+    overlapping Hann windows and power spectral aggregation.
 
     Parameters
     ----------
@@ -59,19 +62,40 @@ def calculate_metrics(signal: np.ndarray, sample_rate: int) -> Dict[str, Any]:
     else:
         zcr = 0.0
 
-    # Spectral features via rFFT
-    n_fft = min(2048, len(signal))
-    if n_fft >= 64:
-        fft_mag = np.abs(np.fft.rfft(signal[:n_fft] * np.hanning(n_fft)))
-        freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
-        sum_mag = np.sum(fft_mag)
+    # Aggregated Spectral Features over entire signal with overlapping windows
+    win_size = min(2048, len(signal))
+    if win_size >= 64:
+        hop_size = win_size // 2  # 50% overlap
+        total_frames = max(1, (len(signal) - win_size) // hop_size + 1)
 
-        if sum_mag > 1e-8:
-            spectral_centroid = float(np.sum(freqs * fft_mag) / sum_mag)
+        # High efficiency for long audio files: limit to max 128 uniformly spaced frames
+        if total_frames <= 128:
+            frame_indices = [i * hop_size for i in range(total_frames)]
+        else:
+            frame_indices = np.linspace(0, len(signal) - win_size, num=128, dtype=int).tolist()
+
+        window = np.hanning(win_size)
+        freqs = np.fft.rfftfreq(win_size, 1.0 / sample_rate)
+
+        # Compute power spectrum for each frame: P(f) = |X(f)|^2
+        accumulated_power = np.zeros(len(freqs), dtype=np.float64)
+
+        for start_idx in frame_indices:
+            frame = signal[start_idx : start_idx + win_size]
+            if len(frame) < win_size:
+                frame = np.pad(frame, (0, win_size - len(frame)), mode="constant")
+            fft_mag = np.abs(np.fft.rfft(frame * window))
+            frame_power = fft_mag ** 2
+            accumulated_power += frame_power
+
+        total_power = float(np.sum(accumulated_power))
+
+        if total_power > 1e-12:
+            spectral_centroid = float(np.sum(freqs * accumulated_power) / total_power)
             low_mask = freqs <= 250.0
             high_mask = freqs >= 4000.0
-            low_energy_ratio = float(np.sum(fft_mag[low_mask]) / sum_mag)
-            high_energy_ratio = float(np.sum(fft_mag[high_mask]) / sum_mag)
+            low_energy_ratio = float(np.sum(accumulated_power[low_mask]) / total_power)
+            high_energy_ratio = float(np.sum(accumulated_power[high_mask]) / total_power)
         else:
             spectral_centroid = 0.0
             low_energy_ratio = 0.0

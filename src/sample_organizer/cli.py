@@ -121,6 +121,10 @@ def handle_organize(args: argparse.Namespace):
         print(f"[Error] Source directory not found: '{args.source}'")
         sys.exit(1)
 
+    if os.path.realpath(args.source) == os.path.realpath(args.destination):
+        print(f"[Error] Source and destination directories cannot be identical: '{args.source}'")
+        sys.exit(1)
+
     print(f"\nScanning '{args.source}' for organization...")
     results = scan_directory(args.source, exclude_dirs=[args.destination])
     valid_count = sum(1 for r in results if "error" not in r)
@@ -128,7 +132,7 @@ def handle_organize(args: argparse.Namespace):
 
     print(f"Found {valid_count} valid samples to organize ({error_scan_count} scan errors). Mode: {args.mode}. Destination: '{args.destination}'")
 
-    summary = organize_samples(results, args.destination, mode=args.mode)
+    summary = organize_samples(results, args.destination, mode=args.mode, source_dir=args.source)
 
     if args.mode == "dry-run":
         print(f"\n[Dry Run] Planned operations: {summary['planned']} (No files written to disk)")

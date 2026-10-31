@@ -1,4 +1,4 @@
-"""Dedicated tests for Metrics and Key Detection (Phase 2 & Phase 6 Refinements)."""
+"""Dedicated tests for Metrics and Key Detection (Phase 2, Phase 6 & Phase 7 Spectral Metrics)."""
 import time
 import numpy as np
 import pytest
@@ -79,12 +79,81 @@ def test_spectral_power_efficiency_long_file():
     m = calculate_metrics(signal, sr)
     elapsed = time.perf_counter() - start_t
 
-    # Must complete in well under 0.5 seconds
-    assert elapsed < 0.5
+    # Must complete in well under 0.25 seconds
+    assert elapsed < 0.25
     assert m["duration_sec"] == 30.0
     assert np.isfinite(m["spectral_centroid"])
     assert 0.0 <= m["low_energy_ratio"] <= 1.0
     assert 0.0 <= m["high_energy_ratio"] <= 1.0
+
+
+@pytest.mark.parametrize("position_sec", [0.5, 12.345, 27.89])
+def test_high_frequency_transients_in_different_positions(position_sec):
+    """
+    Verify that a brief high-frequency transient in a 30s file is reliably captured
+    regardless of its temporal position (beginning, middle, or end).
+    """
+    sr = 44100
+    duration = 30.0
+    signal = np.zeros(int(sr * duration), dtype=np.float32)
+
+    # Low-level background rumble (100 Hz)
+    t = np.linspace(0, duration, len(signal), endpoint=False)
+    signal += (0.01 * np.sin(2 * np.pi * 100.0 * t)).astype(np.float32)
+
+    # Insert a 15ms 6500 Hz transient burst at position_sec
+    burst_len = int(sr * 0.015)
+    t_burst = np.linspace(0, 0.015, burst_len, endpoint=False)
+    burst = (0.8 * np.sin(2 * np.pi * 6500.0 * t_burst)).astype(np.float32)
+    start_idx = int(position_sec * sr)
+    signal[start_idx : start_idx + burst_len] += burst
+
+    m = calculate_metrics(signal, sr)
+    # Energy pooling ensures the burst is captured
+    assert m["high_energy_ratio"] > 0.02
+    assert m["spectral_centroid"] > 200.0
+
+
+def test_long_silence_with_brief_events():
+    """Verify that long silence does not prevent capturing short high-energy events."""
+    sr = 44100
+    duration = 20.0
+    signal = np.zeros(int(sr * duration), dtype=np.float32)
+
+    # Place a single 20ms burst at second 14.5 surrounded by 19.98s of complete silence
+    burst_len = int(sr * 0.02)
+    t_burst = np.linspace(0, 0.02, burst_len, endpoint=False)
+    burst = (0.9 * np.sin(2 * np.pi * 5000.0 * t_burst)).astype(np.float32)
+    start_idx = int(14.5 * sr)
+    signal[start_idx : start_idx + burst_len] = burst
+
+    m = calculate_metrics(signal, sr)
+    assert m["duration_sec"] == 20.0
+    assert m["high_energy_ratio"] > 0.60
+    assert m["spectral_centroid"] > 3500.0
+
+
+def test_distributed_brief_events():
+    """Verify aggregated spectral metrics capture multiple brief events distributed across time."""
+    sr = 44100
+    duration = 25.0
+    signal = np.zeros(int(sr * duration), dtype=np.float32)
+
+    event_times = [2.0, 7.5, 13.0, 19.5, 23.0]
+    burst_len = int(sr * 0.02)
+    t_burst = np.linspace(0, 0.02, burst_len, endpoint=False)
+
+    for i, t_pos in enumerate(event_times):
+        freq = 6000.0 if i % 2 == 0 else 150.0
+        burst = (0.7 * np.sin(2 * np.pi * freq * t_burst)).astype(np.float32)
+        idx = int(t_pos * sr)
+        signal[idx : idx + burst_len] = burst
+
+    m = calculate_metrics(signal, sr)
+    assert m["duration_sec"] == 25.0
+    assert m["low_energy_ratio"] > 0.15
+    assert m["high_energy_ratio"] > 0.15
+    assert 500.0 < m["spectral_centroid"] < 5000.0
 
 
 def test_key_detection_triads():

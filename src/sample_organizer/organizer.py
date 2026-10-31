@@ -1,13 +1,114 @@
 """Sample organization engine: recursive scanning, classification, and safe file sorting."""
 import os
 import shutil
-from typing import Dict, Any, List, Optional, Set
+import hashlib
+from typing import Dict, Any, List, Optional, Set, Tuple
 from .audio_io import load_audio
 from .metrics import calculate_metrics
 from .key_detector import estimate_key
 from .bpm_detector import estimate_bpm
 
 SUPPORTED_EXTENSIONS = [".wav", ".aif", ".aiff", ".flac"]
+
+
+def compute_sha256(file_path: str) -> str:
+    """Compute the SHA-256 hex digest of a file in streaming chunks."""
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def copy_file_exclusive(
+    src_path: str,
+    desired_target: str,
+    reserved_paths: Optional[Set[str]] = None,
+) -> Tuple[str, str]:
+    """
+    Atomically copy src_path to a non-colliding destination using exclusive creation ('xb').
+
+    Guarantees:
+    - Never overwrites an existing file, even under concurrent operations.
+    - If a collision occurs, increments counter (_001, _002, ...) until an exclusive slot is acquired.
+    - Automatically removes partial files if writing or verification fails.
+    - Verifies byte-level integrity between source and destination using SHA-256.
+    - Preserves file metadata timestamps.
+
+    Returns
+    -------
+    (final_destination_path, file_sha256) : Tuple[str, str]
+    """
+    real_src = os.path.realpath(src_path)
+    if not os.path.exists(src_path):
+        raise FileNotFoundError(f"Source file does not exist: '{src_path}'")
+
+    src_hash = compute_sha256(src_path)
+    src_size = os.path.getsize(src_path)
+
+    base_dir, filename = os.path.split(desired_target)
+    stem, ext = os.path.splitext(filename)
+    os.makedirs(base_dir, exist_ok=True)
+
+    counter = 0
+    while True:
+        if counter == 0:
+            candidate = os.path.normpath(desired_target)
+        else:
+            candidate = os.path.normpath(os.path.join(base_dir, f"{stem}_{counter:03d}{ext}"))
+        counter += 1
+
+        if reserved_paths is not None and candidate in reserved_paths:
+            continue
+
+        real_candidate = os.path.realpath(candidate)
+        if real_candidate == real_src:
+            raise ValueError(f"Source and destination paths are identical: '{src_path}'")
+
+        # Atomic exclusive creation ('xb' uses O_CREAT|O_EXCL on POSIX, CREATE_NEW on Windows)
+        try:
+            with open(candidate, "xb") as dst_f:
+                dst_hash = hashlib.sha256()
+                try:
+                    with open(src_path, "rb") as src_f:
+                        while chunk := src_f.read(65536):
+                            dst_f.write(chunk)
+                            dst_hash.update(chunk)
+                    dst_f.flush()
+                    os.fsync(dst_f.fileno())
+                except Exception:
+                    # Clean up partial file on write failure
+                    try:
+                        dst_f.close()
+                        if os.path.exists(candidate):
+                            os.remove(candidate)
+                    except Exception:
+                        pass
+                    raise
+
+            # Verify written destination SHA-256 and size
+            if dst_hash.hexdigest() != src_hash or os.path.getsize(candidate) != src_size:
+                try:
+                    if os.path.exists(candidate):
+                        os.remove(candidate)
+                except Exception:
+                    pass
+                raise RuntimeError(f"Integrity check failed: SHA-256 mismatch copying '{src_path}' to '{candidate}'")
+
+            # Preserve modification metadata
+            try:
+                shutil.copystat(src_path, candidate)
+            except Exception:
+                pass
+
+            if reserved_paths is not None:
+                reserved_paths.add(candidate)
+
+            return candidate, src_hash
+
+        except FileExistsError:
+            # File exists or was created concurrently; try next candidate suffix
+            continue
 
 
 def classify_sample(
@@ -208,18 +309,28 @@ def organize_samples(
     scan_results: List[Dict[str, Any]],
     output_dir: str,
     mode: str = "copy",  # "copy", "move", "dry-run"
+    source_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Sort analyzed samples into organized destination folders safely.
 
     Guarantees:
-    - Never overwrites existing destination files (deterministic collision renaming).
-    - Preserves source file integrity and validates size on copy.
+    - Rejects operation if source and destination are the same directory.
+    - Never overwrites existing destination files via atomic exclusive file creation ('xb').
+    - Guarantees data integrity via SHA-256 verification and clears partial files on failure.
+    - For 'move', verifies destination integrity before removing source, then verifies source non-existence.
     - Captures and categorizes read, analysis, and write errors per file.
     """
     valid_modes = ("copy", "move", "dry-run")
     if mode not in valid_modes:
         raise ValueError(f"Invalid mode '{mode}'. Expected one of: {valid_modes}")
+
+    real_output_dir = os.path.realpath(output_dir)
+
+    if source_dir is not None:
+        real_src_dir = os.path.realpath(source_dir)
+        if real_src_dir == real_output_dir:
+            raise ValueError(f"Source and destination directories cannot be identical: '{output_dir}'")
 
     summary: Dict[str, Any] = {
         "total": len(scan_results),
@@ -247,6 +358,22 @@ def organize_samples(
             continue
 
         src_path = os.path.normpath(src_path)
+        real_src = os.path.realpath(src_path)
+
+        # Check directory collision for this sample
+        if os.path.realpath(os.path.dirname(src_path)) == real_output_dir:
+            summary["errors"] += 1
+            summary["operations"].append({
+                "source": src_path,
+                "destination": None,
+                "category": "Unknown",
+                "mode": mode,
+                "status": "error",
+                "error_type": "safety",
+                "error_msg": f"Source directory matches destination directory: '{real_output_dir}'",
+            })
+            continue
+
         category = item.get("category", "Unknown")
 
         has_key = item.get("key") and item.get("key") != "Unknown" and item.get("key_confidence", 0) >= 0.35
@@ -280,45 +407,49 @@ def organize_samples(
             dest_filename = orig_filename
 
         desired_target = os.path.join(subfolder, dest_filename)
-        final_dest = resolve_unique_path(desired_target, reserved_paths)
 
-        op: Dict[str, Any] = {
+        if mode == "dry-run":
+            final_dest = resolve_unique_path(desired_target, reserved_paths)
+            op: Dict[str, Any] = {
+                "source": src_path,
+                "destination": final_dest,
+                "category": category,
+                "mode": mode,
+                "status": "planned",
+            }
+            summary["planned"] += 1
+            summary["operations"].append(op)
+            continue
+
+        # Physical execution with atomic exclusive file creation & SHA-256 verification
+        op = {
             "source": src_path,
-            "destination": final_dest,
+            "destination": None,
             "category": category,
             "mode": mode,
             "status": "planned",
         }
 
-        if mode == "dry-run":
-            summary["planned"] += 1
-            summary["operations"].append(op)
-            continue
-
-        # Physical execution with safety checks
         try:
-            if src_path == final_dest:
+            if os.path.realpath(desired_target) == real_src:
                 raise ValueError("Source and destination paths are identical")
 
-            if not os.path.exists(src_path):
-                raise FileNotFoundError(f"Source file disappeared: '{src_path}'")
-
-            src_size = os.path.getsize(src_path)
-            os.makedirs(os.path.dirname(final_dest), exist_ok=True)
+            final_dest, file_hash = copy_file_exclusive(src_path, desired_target, reserved_paths)
+            op["destination"] = final_dest
 
             if mode == "copy":
-                shutil.copy2(src_path, final_dest)
-                # Verify integrity
-                if not os.path.exists(src_path) or os.path.getsize(src_path) != src_size:
-                    raise RuntimeError(f"Integrity check failed: source file '{src_path}' was modified")
-                if not os.path.exists(final_dest) or os.path.getsize(final_dest) != src_size:
-                    raise RuntimeError(f"Integrity check failed: destination size mismatch on '{final_dest}'")
+                # Verify source file was not modified
+                if not os.path.exists(src_path) or compute_sha256(src_path) != file_hash:
+                    raise RuntimeError(f"Integrity check failed: source file '{src_path}' was modified during copy")
                 op["status"] = "copied"
 
             elif mode == "move":
-                shutil.move(src_path, final_dest)
-                if not os.path.exists(final_dest):
-                    raise RuntimeError(f"Failed to verify moved destination '{final_dest}'")
+                # Safely delete source after destination was atomically written and verified
+                os.remove(src_path)
+                if os.path.exists(src_path):
+                    raise RuntimeError(f"Failed to remove source file '{src_path}' after move")
+                if not os.path.exists(final_dest) or compute_sha256(final_dest) != file_hash:
+                    raise RuntimeError(f"Failed to verify integrity of moved destination '{final_dest}'")
                 op["status"] = "moved"
 
             summary["processed"] += 1

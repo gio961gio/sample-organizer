@@ -4,15 +4,15 @@ This roadmap documents completed milestones and future engineering phases for **
 
 ---
 
-## Phase 1: Core Engine & Audio I/O Stabilization (Completed - v0.1.0)
-- [x] High-fidelity multi-format I/O (`WAV`, `AIFF`, `FLAC`) using `soundfile` backend.
-- [x] Polyphase resampling via `scipy.signal.resample_poly` with exact rational factor reduction.
-- [x] Dynamics & spectral metrics: Peak, RMS, Crest Factor, Zero Crossing Rate, Spectral Centroid, Low/High energy ratios.
-- [x] Cognitive key detection using Krumhansl-Schmuckler profiles with non-tonal and noise rejection (`Unknown`).
-- [x] Robust BPM estimation via FFT autocorrelation, periodicity significance ($z$-score), and Gaussian tempo prior.
-- [x] Non-destructive `--mode dry-run` with zero disk modifications.
-- [x] Deterministic name collision resolution (`_001.wav`, `_002.wav`) preventing accidental overwrites.
-- [x] CLI commands (`analyze`, `scan`, `organize`) and automated GitHub Actions CI workflow.
+## Completed Milestones (v0.1.0 – v0.2.0)
+- [x] **Multi-Format Audio I/O**: High-fidelity ingestion (`WAV`, `AIFF`, `FLAC`) using `soundfile` with polyphase resampling (`scipy.signal.resample_poly`).
+- [x] **Cognitive Key Detection**: Krumhansl-Schmuckler profiles with strict non-tonal and noise rejection (`Unknown`).
+- [x] **Acoustic & Full-Duration Spectral Metrics**: Peak, RMS, Crest Factor, ZCR, Spectral Centroid, and power ratios across overlapping Hann windows with transient energy pooling.
+- [x] **Accurate BPM & Octave Disambiguation**: Sub-sample parabolic peak interpolation, unbiased octave harmonic analysis across 60–180 BPM, boundary detection, and candidate margin confidence scoring.
+- [x] **Multi-Feature Classification**: Combinatorial classification balancing spectral crest factors, harmonic key confidence, and rhythmic periodicity.
+- [x] **Atomic File Safety & Integrity**: Exclusive creation (`'xb'`), SHA-256 byte verification on copy/move, partial file cleanup on error, and canonical path checks preventing destination overwriting.
+- [x] **CLI Subcommands**: `analyze`, `scan`, `organize` (with `--mode dry-run`, `copy`, and `move`).
+- [x] **Comprehensive Test Suite**: Automated integration and regression test matrix on GitHub Actions CI.
 
 ---
 

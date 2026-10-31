@@ -8,7 +8,9 @@ def calculate_metrics(signal: np.ndarray, sample_rate: int) -> Dict[str, Any]:
     Compute standard acoustic dynamics and aggregated spectral power metrics.
 
     Spectral metrics are evaluated across the full duration of the signal using
-    overlapping Hann windows and power spectral aggregation.
+    overlapping Hann windows and power spectral aggregation. For long signals,
+    uniform sampling is augmented with energy-aware pooling to ensure brief
+    high-frequency transients and localized acoustic events are never dropped.
 
     Parameters
     ----------
@@ -68,19 +70,31 @@ def calculate_metrics(signal: np.ndarray, sample_rate: int) -> Dict[str, Any]:
         hop_size = win_size // 2  # 50% overlap
         total_frames = max(1, (len(signal) - win_size) // hop_size + 1)
 
-        # High efficiency for long audio files: limit to max 128 uniformly spaced frames
+        # Frame selection: full coverage for <= 128 frames; uniform + energy-pooled for long files
         if total_frames <= 128:
-            frame_indices = [i * hop_size for i in range(total_frames)]
+            selected_indices = [i * hop_size for i in range(total_frames)]
         else:
-            frame_indices = np.linspace(0, len(signal) - win_size, num=128, dtype=int).tolist()
+            uniform_indices = np.linspace(0, len(signal) - win_size, num=128, dtype=int).tolist()
+
+            # Fast vectorized frame energy via cumulative sum of squared samples
+            cum_sq = np.concatenate(([0.0], np.cumsum(signal.astype(np.float64) ** 2)))
+            all_st = np.arange(total_frames) * hop_size
+            all_en = all_st + win_size
+            frame_energies = cum_sq[all_en] - cum_sq[all_st]
+
+            # Top 64 energetic frames guarantee capturing brief transient bursts anywhere in the file
+            top_energies_idx = np.argsort(frame_energies)[-64:]
+            top_st = (top_energies_idx * hop_size).tolist()
+
+            selected_indices = sorted(set(uniform_indices + top_st))
 
         window = np.hanning(win_size)
         freqs = np.fft.rfftfreq(win_size, 1.0 / sample_rate)
 
-        # Compute power spectrum for each frame: P(f) = |X(f)|^2
+        # Compute power spectrum for each selected frame: P(f) = |X(f)|^2
         accumulated_power = np.zeros(len(freqs), dtype=np.float64)
 
-        for start_idx in frame_indices:
+        for start_idx in selected_indices:
             frame = signal[start_idx : start_idx + win_size]
             if len(frame) < win_size:
                 frame = np.pad(frame, (0, win_size - len(frame)), mode="constant")

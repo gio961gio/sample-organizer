@@ -6,7 +6,7 @@
 
 > **Audio Sample Analysis, Harmonic Key Detection & Safe Library Organization Engine**
 
-Sample Organizer is a modular Python command-line tool and DSP library designed for audio producers, sound designers, and sample archivists. It ingests unorganized audio collections (WAV, AIFF, FLAC), computes acoustic and spectral dynamics, detects musical key and tempo (BPM), and sorts audio samples into structured folders with deterministic collision handling and zero data loss.
+Sample Organizer is a modular Python command-line tool and DSP library designed for audio producers, sound designers, and sample archivists. It ingests unorganized audio collections (WAV, AIFF, FLAC), computes acoustic and spectral dynamics, detects musical key and tempo (BPM), and sorts audio samples into structured folders with atomic exclusive file creation and zero data loss.
 
 ---
 
@@ -14,13 +14,15 @@ Sample Organizer is a modular Python command-line tool and DSP library designed 
 
 - **Multi-Format Audio I/O**: High-fidelity ingestion of WAV (PCM 8/16/24/32-bit and IEEE float), AIFF/AIFF-C, and FLAC using `soundfile` (`libsndfile`). Downmixes multichannel buffers to mono via equal-weight channel averaging and provides exact polyphase resampling via `scipy.signal.resample_poly`.
 - **Harmonic Key Estimation**: Computes a 12-dimensional pitch chroma vector and correlates against cognitive **Krumhansl-Schmuckler** Major and Minor profiles. Returns `Unknown` for silence, non-tonal noise, or ambiguous distributions to prevent false positive classifications.
-- **FFT Onset BPM Detection**: Estimates loop tempo using energy flux onset envelopes and FFT-accelerated autocorrelation within 60–180 BPM. Evaluates periodicity significance ($z$-score) and incorporates a gentle Gaussian tempo prior to resolve half-time/double-time ambiguities; returns `None` for non-rhythmic audio.
-- **Acoustic & Spectral Metrics**: Computes Peak (dBFS), RMS (dBFS), Crest Factor (transient dynamics), Zero Crossing Rate (ZCR), Spectral Centroid (Hz), Low Energy Ratio (< 250 Hz), and High Energy Ratio (> 4000 Hz).
-- **Heuristic Classification**: Categorizes samples into `Kicks`, `Snares_Claps`, `Hats_Cymbals`, `Percussion`, `Drum_Loops`, `Melodic_Loops`, `FX_Textures`, or `Unknown`.
+- **Accurate BPM & Octave Detection**: Estimates loop tempo using energy flux onset envelopes, FFT autocorrelation, and 3-point parabolic sub-sample peak refinement. Resolves half-time and double-time ambiguities across 60–180 BPM without arbitrary tempo priors, adjusting confidence according to candidate margins and rhythmic ambiguity.
+- **Acoustic & Full-Duration Spectral Metrics**: Computes Peak (dBFS), RMS (dBFS), Crest Factor (transient dynamics), Zero Crossing Rate (ZCR), Spectral Centroid (Hz), Low Energy Ratio (< 250 Hz), and High Energy Ratio (> 4000 Hz). Uses overlapping Hann windows with energy-aware pooling to ensure brief high-frequency transients anywhere in long files are captured.
+- **Multi-Feature Classification**: Categorizes samples into `Kicks`, `Snares_Claps`, `Hats_Cymbals`, `Percussion`, `Drum_Loops`, `Melodic_Loops`, `FX_Textures`, or `Unknown` combining spectral dynamics, harmonic confidence, and rhythmic periodicity.
 - **Safe File Organization**:
   - **Non-destructive Dry-Run**: `--mode dry-run` evaluates and displays the operation plan without writing files or creating directories.
-  - **Collision Prevention**: Automatically resolves filename collisions deterministically (`sample_001.wav`, `sample_002.wav`) without overwriting existing files.
-  - **Loop Exclusion**: Automatically skips target destination directories when nested inside the source folder.
+  - **Atomic Exclusive Creation**: Destination files are created using atomic exclusive creation (`'xb'`) to prevent race conditions or concurrent overwrites.
+  - **Deterministic Collision Handling**: Automatically resolves filename collisions deterministically (`sample_001.wav`, `sample_002.wav`).
+  - **SHA-256 Verification & Cleanup**: Verifies byte integrity between source and destination with SHA-256, automatically deleting partial files if an operation fails.
+  - **Directory Collision Protection**: Rejects operations where source and destination paths are identical using canonical path resolution (`os.path.realpath`).
 
 ---
 
@@ -34,14 +36,14 @@ sample-organizer/
 │       ├── audio_io.py          # Soundfile backend I/O & polyphase resampling
 │       ├── metrics.py           # Dynamics, ZCR & spectral features
 │       ├── key_detector.py      # Chromagram & Krumhansl-Schmuckler key engine
-│       ├── bpm_detector.py      # FFT onset autocorrelation & tempo prior
-│       ├── organizer.py         # Directory scanner, classifier & collision resolver
+│       ├── bpm_detector.py      # FFT onset autocorrelation & octave evaluation
+│       ├── organizer.py         # Directory scanner, classifier & atomic file safety
 │       └── cli.py               # Subcommands (analyze, scan, organize)
 ├── tests/
 │   ├── test_audio_io.py         # Audio I/O format and resampling tests
-│   ├── test_metrics_key.py      # Acoustic metrics & key rejection tests
-│   ├── test_bpm_detector.py     # BPM pulse & non-rhythmic tests
-│   ├── test_organizer.py        # Safe organization & dry-run tests
+│   ├── test_metrics_key.py      # Acoustic metrics, transients & key rejection tests
+│   ├── test_bpm_detector.py     # BPM pulse, boundary & octave ambiguity tests
+│   ├── test_organizer.py        # File safety, collision, SHA-256 & E2E regression tests
 │   └── test_sample_organizer.py # Integrated suite
 ├── .github/
 │   └── workflows/ci.yml         # GitHub Actions CI matrix

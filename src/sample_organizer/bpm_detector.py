@@ -1,6 +1,6 @@
-"""BPM and tempo estimation via energy flux and FFT-based onset autocorrelation."""
+"""BPM and tempo estimation via energy flux, FFT onset autocorrelation, and octave evaluation."""
 import numpy as np
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 
 def estimate_bpm(
@@ -12,9 +12,11 @@ def estimate_bpm(
     """
     Estimate the tempo (BPM) of rhythmic audio signals without arbitrary tempo priors.
 
-    Evaluates both half-time and double-time interpretations using objective
-    harmonic summation across integer lag multiples, then recalculates confidence
-    based on the definitive selected tempo.
+    Evaluates candidate periods using parabolic sub-sample peak refinement and
+    balanced octave (half-time / double-time) harmonic analysis. Confidently
+    disambiguates rhythmic octaves without systematically favoring longer lags,
+    and scales confidence according to peak prominence, candidate margins, and
+    octave ambiguity.
 
     Parameters
     ----------
@@ -93,73 +95,144 @@ def estimate_bpm(
     autocorr = np.fft.irfft(f_onsets * np.conj(f_onsets))[:n]
 
     frame_rate = float(sample_rate) / float(hop_size)
-    min_lag = max(1, int(frame_rate * (60.0 / max_bpm)))
-    max_lag = min(n - 1, int(frame_rate * (60.0 / min_bpm)))
+    target_min_lag = frame_rate * (60.0 / max_bpm)
+    target_max_lag = frame_rate * (60.0 / min_bpm)
 
-    if max_lag <= min_lag:
+    # Pad search window slightly to allow boundary peak detection and parabolic interpolation
+    search_min = max(1, int(np.floor(target_min_lag)) - 2)
+    search_max = min(n - 2, int(np.ceil(target_max_lag)) + 2)
+
+    if search_max <= search_min:
         return default_non_rhythmic
 
-    search_region = autocorr[min_lag : max_lag + 1]
+    search_region = autocorr[search_min : search_max + 1]
     if len(search_region) == 0:
         return default_non_rhythmic
 
     mean_val = float(np.mean(search_region))
     std_val = float(np.std(search_region)) + 1e-8
 
-    # Find prominent local peaks in search region
-    candidate_lags = []
-    for lag in range(min_lag + 1, max_lag):
+    # Detect local peaks with 3-point parabolic interpolation for sub-sample accuracy
+    peaks: List[Dict[str, Any]] = []
+    for lag in range(search_min + 1, search_max):
         if autocorr[lag] > autocorr[lag - 1] and autocorr[lag] >= autocorr[lag + 1]:
             if autocorr[lag] > mean_val:
-                candidate_lags.append(lag)
+                y0, y1, y2 = float(autocorr[lag - 1]), float(autocorr[lag]), float(autocorr[lag + 1])
+                denom = y0 - 2.0 * y1 + y2
+                if abs(denom) > 1e-8:
+                    delta = 0.5 * (y0 - y2) / denom
+                    delta = float(np.clip(delta, -1.0, 1.0))
+                    r_lag = lag + delta
+                    r_val = y1 - 0.25 * (y0 - y2) * delta
+                else:
+                    r_lag = float(lag)
+                    r_val = y1
 
-    if not candidate_lags:
-        # Fallback to argmax in search region
-        best_lag = int(np.argmax(search_region)) + min_lag
-        candidate_lags = [best_lag]
+                bpm = 60.0 / (r_lag / frame_rate)
+                # Allow a tiny tolerance around target boundaries before clipping
+                if (min_bpm - 2.0) <= bpm <= (max_bpm + 2.0):
+                    peaks.append({
+                        "lag": r_lag,
+                        "val": max(0.0, r_val),
+                        "bpm": bpm,
+                        "int_lag": lag,
+                    })
 
-    # Evaluate each candidate using unbiased harmonic summation:
-    # Harmonic score S(L) = autocorr[L] + 0.5 * autocorr[2L] + 0.25 * autocorr[3L]
-    scored_candidates = []
-    for lag in candidate_lags:
-        h_score = autocorr[lag]
-        if lag * 2 < len(autocorr):
-            h_score += 0.5 * autocorr[lag * 2]
-        if lag * 3 < len(autocorr):
-            h_score += 0.25 * autocorr[lag * 3]
+    if not peaks:
+        best_i = int(np.argmax(search_region)) + search_min
+        r_lag = float(best_i)
+        r_val = max(0.0, float(autocorr[best_i]))
+        peaks.append({
+            "lag": r_lag,
+            "val": r_val,
+            "bpm": 60.0 / (r_lag / frame_rate),
+            "int_lag": best_i,
+        })
 
-        scored_candidates.append((h_score, lag))
+    # Sort peaks descending by value
+    peaks.sort(key=lambda p: p["val"], reverse=True)
 
-    scored_candidates.sort(key=lambda c: c[0], reverse=True)
-    best_score, selected_lag = scored_candidates[0]
+    # Disambiguate octave relationships (half-time vs double-time):
+    # A candidate at lag L is a subharmonic if an octave peak exists near L/2 with ratio >= 0.40.
+    candidates = []
+    for p in peaks:
+        half_lag = p["lag"] / 2.0
+        half_match = None
+        for other in peaks:
+            if abs(other["lag"] - half_lag) <= max(1.5, 0.06 * p["lag"]):
+                half_match = other
+                break
 
-    # Recalculate confidence definitively on the selected lag
-    peak_val = autocorr[selected_lag]
+        is_subharmonic = False
+        octave_ambiguity = 0.0
+
+        if half_match is not None:
+            ratio = half_match["val"] / (p["val"] + 1e-8)
+            if ratio >= 0.40:
+                # Clear onset presence at half the lag: fundamental beat is the faster tempo
+                is_subharmonic = True
+            elif ratio >= 0.20:
+                # Genuine octave ambiguity: record ambiguity factor to adjust confidence
+                octave_ambiguity = ratio
+
+        candidates.append({
+            "peak": p,
+            "is_subharmonic": is_subharmonic,
+            "octave_ambiguity": octave_ambiguity,
+            "score": p["val"],
+        })
+
+    # Filter out subharmonics whose fundamental faster tempo is represented
+    viable = [c for c in candidates if not c["is_subharmonic"]]
+    if not viable:
+        viable = candidates
+
+    viable.sort(key=lambda c: c["score"], reverse=True)
+    best = viable[0]
+    p_best = best["peak"]
+    selected_lag = int(round(p_best["lag"]))
+    selected_bpm = float(np.clip(p_best["bpm"], min_bpm, max_bpm))
+
+    # Definitive confidence calculation
+    peak_val = p_best["val"]
     z_score = (peak_val - mean_val) / std_val
 
-    # Peak contrast with adjacent valleys
+    # Contrast with surrounding valleys
     valley_window = max(2, int(frame_rate * 0.05))  # 50ms window
-    left_bound = max(min_lag, selected_lag - valley_window)
-    right_bound = min(max_lag, selected_lag + valley_window)
+    left_bound = max(search_min, selected_lag - valley_window)
+    right_bound = min(search_max, selected_lag + valley_window)
     surrounding = autocorr[left_bound : right_bound + 1]
     valley_val = float(np.min(surrounding)) if len(surrounding) > 0 else mean_val
-    peak_prominence = (peak_val - valley_val) / (std_val + 1e-8)
+    peak_prominence = (peak_val - valley_val) / std_val
 
     if z_score < 1.75 or peak_val <= 0 or peak_prominence < 0.5:
         return default_non_rhythmic
 
-    confidence_z = np.clip((z_score - 1.5) / 3.0, 0.0, 1.0)
-    confidence_prom = np.clip(peak_prominence / 3.0, 0.0, 1.0)
-    confidence = float(np.clip(0.6 * confidence_z + 0.4 * confidence_prom, 0.0, 1.0))
+    # Compute margin to the runner-up distinct tempo candidate
+    margin = 1.0
+    for c in viable[1:]:
+        if abs(c["peak"]["bpm"] - p_best["bpm"]) > 4.0:
+            margin = max(0.0, (best["score"] - c["score"]) / (best["score"] + 1e-6))
+            break
 
+    conf_z = np.clip((z_score - 1.5) / 3.0, 0.0, 1.0)
+    conf_prom = np.clip(peak_prominence / 3.0, 0.0, 1.0)
+    conf_margin = np.clip(margin, 0.3, 1.0)
+
+    raw_conf = float(0.5 * conf_z + 0.3 * conf_prom + 0.2 * conf_margin)
+
+    # Reduce confidence when rhythmic octave is ambiguous
+    if best["octave_ambiguity"] > 0:
+        raw_conf *= float(1.0 - 0.4 * best["octave_ambiguity"])
+
+    confidence = float(np.clip(raw_conf, 0.0, 1.0))
     is_rhythmic = confidence >= 0.20
+
     if not is_rhythmic:
         return default_non_rhythmic
 
-    estimated_bpm = 60.0 / (selected_lag / frame_rate)
-
     return {
-        "bpm": round(float(estimated_bpm), 1),
+        "bpm": round(float(selected_bpm), 1),
         "confidence": round(confidence, 3),
         "is_rhythmic": True,
     }
